@@ -1,0 +1,204 @@
+---
+title: "CityShield: Emergency Response and Infrastructure Resilience on the Chennai Road Network"
+subtitle: "Design and Analysis of Algorithms - project report"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, out.width = "92%", fig.align = "center")
+root <- normalizePath(file.path(getwd(), ".."), winslash = "/")
+if (!file.exists(file.path(root, "R", "core", "load_all.R"))) root <- normalizePath(getwd(), winslash = "/")
+rdir <- file.path(root, "benchmarks", "results")
+rd  <- function(f) utils::read.csv(file.path(rdir, f), stringsAsFactors = FALSE)
+img <- function(f) { p <- file.path(rdir, f); if (file.exists(p)) knitr::include_graphics(p) else cat("*(figure", f, "not generated)*") }
+notes <- if (file.exists(file.path(rdir, "notes.rds"))) readRDS(file.path(rdir, "notes.rds")) else list()
+note <- function(id) if (!is.null(notes[[id]])) cat(notes[[id]]) else cat("*(run benchmarks/run_all.R)*")
+G <- readRDS(file.path(root, "data", "osm", "chennai_graph.rds"))
+tsum <- if (file.exists(file.path(rdir, "test_summary.rds"))) readRDS(file.path(rdir, "test_summary.rds")) else NULL
+reg <- if (file.exists(file.path(rdir, "algorithm_registry.csv"))) rd("algorithm_registry.csv") else NULL
+```
+
+# Problem and motivation
+
+A coastal metropolis such as Chennai has to answer four operational questions *before* and *during* a flood, fire or accident surge:
+
+| Question | CityShield's answer | Main algorithms |
+|---|---|---|
+| **Where do emergency resources go?** | station placement, sensor placement | set cover, vertex cover (exact when it finishes, otherwise approximate) |
+| **How are responders dispatched?** | ambulance-to-incident assignment, fastest routes, incident ranking | push-relabel max flow (bipartite matching), Dijkstra, quicksort |
+| **How are people evacuated?** | flow of people through roads of limited capacity; which roads cross the flood boundary; the affected area | push-relabel max flow, sweep line, Graham scan |
+| **How resilient is the road network?** | the weakest link of the network, the worst stretch of incident load | Karger's min cut, maximum subarray |
+| **What do crews need on the ground?** | split supplies, choose upgrades, plan an inspection tour, search and de-duplicate reports | fractional knapsack, 0/1 knapsack, TSP (branch and bound / 2-approximation), KMP, LCS |
+
+The project is also a *study*: every algorithm the dashboard uses (greedy, divide and conquer, dynamic programming, branch and bound, string matching, graph, geometric, randomized and approximation algorithms) is implemented **from scratch in R** with explicit loops and hand-written data structures and tested against a brute-force or reference implementation; the exact-versus-approximate algorithms and the randomized ones are also benchmarked against their theoretical complexity. The code contains only the algorithms the dashboard uses. The road network is the real OpenStreetMap network of Chennai: **`r format(G$n, big.mark=",")` junction nodes and `r format(G$m, big.mark=",")` directed road segments** (about `r format(round(sum(G$extra$len_m)/1000), big.mark=",")` km of directed road), cached once with `saveRDS()`.
+
+# System architecture
+
+```
+cityshield/
+  R/core/            graph.R (CSR + residual graphs)  structures.R (queue, stack, heaps)  sort_utils.R
+                     geometry_types.R  timer.R (time_it)  study_area.R  data_io.R  load_all.R
+  R/m1_greedy_dc/ ... R/m7_complexity/     one folder per module
+  scripts/           01 renv  02/02b OSM download  03 build graph  04 synthetic data  05 precompute  06 app smoke test
+  tests/testthat/    reference + igraph/sf validation, edge cases, banned-function compliance test
+  benchmarks/        5 comparison experiments (05-09), per-algorithm registry, CSVs and ggplot2 PNGs in results/
+  app/               Shiny dashboard (bslib + leaflet + plotly), one file per tab
+  report/            this document and the viva notes
+```
+
+**Design choices** (and why):
+
+* **Road graph = CSR** (`offset`, `target`, `weight` arrays + node coordinates). Enumerating the out-neighbours of `u` is an array slice, memory is O(V+E), and the loop structure of every graph algorithm visibly matches its textbook complexity. Raw OSM ways are contracted at junctions (degree-2 shape points removed) and reduced to the largest strongly connected component, so every node can reach every other.
+* **Flow network = separate residual-edge representation**: edges are stored in pairs `(e, rev(e))` with linked adjacency lists (`head`/`nxt`). Flow algorithms mutate residual capacities in place.
+* **Everything mutable lives in an `environment`.** R copies a vector whenever a function modifies it, so a list-based heap, queue or graph would cost O(n) per update. The queue (preallocated circular buffer with head/tail indices), stack, binary min-heap, lexicographic event heap, treap nodes and the flow graph are environments - this was verified, and two accidental copy-on-modify bugs in the first versions of branch-and-bound and the sweep line (`x[i] <<- v` on closure variables) were found through benchmarking and fixed.
+* **No recursion where depth can be large**: branch and bound (vertex/set cover, TSP), quicksort and tree traversals use explicit stacks or queues. Recursion remains only where depth is O(log n) (maximum subarray, balanced-tree operations).
+* **Banned shortcuts are enforced by a test.** `tests/testthat/test-banned-functions.R` scans every source file under `R/` (comments and strings stripped) and fails if `outer`, `which`, `order`, `rank`, any `*apply`/`Map`/`Reduce`/`Filter`, or `sort` is *called* (`sort` is allowed only in `*_ref.R` reference files). `igraph` and `sf` appear only in loading code and in tests (and `igraph` in the Karger benchmark).
+* **One timing wrapper**: `time_it()` (built on `bench::mark`) produces every number in `benchmarks/results`.
+* **Dashboard**: expensive results are precomputed by `scripts/05_precompute.R` into `.rds` files; cheap algorithms run live. Where a problem has an exact and an approximate solver, the exact one is used whenever it finishes within its node budget, otherwise the approximation.
+
+```{r tests, results='asis'}
+if (!is.null(tsum)) {
+  cat(sprintf("**Test suite:** %d test blocks in %d files, %d expectations, **%d failures**, %d skipped (`Rscript tests/testthat.R`).\n\n",
+              sum(tsum$tests), nrow(tsum), sum(tsum$expectations), sum(tsum$failed), sum(tsum$skipped)))
+  print(knitr::kable(tsum[, c("file", "tests", "expectations", "failed")], row.names = FALSE))
+} else cat("*(run scripts/07_test_summary.R)*")
+```
+
+# Algorithms used
+
+Notation: *n* = input size; *V, E* = nodes, edges; *k* = output size; *W* = numeric capacity. Each row lists the problem solved, the approach, a correctness argument, the complexity and the CityShield application. Complexities are those *proved or cited in the code's Roxygen header* of the same function.
+
+**Algorithm design stages** used throughout: (1) state the problem and its inputs/outputs precisely; (2) choose the paradigm from the structure of the problem (optimal substructure + greedy choice -> greedy; independent subproblems -> divide and conquer; overlapping subproblems -> DP; search tree -> branch and bound); (3) prove correctness (loop invariant, exchange argument or induction); (4) analyse time and space (recurrence / counting); (5) implement with explicit data structures; (6) test against a reference.
+
+## Greedy, divide and conquer, dynamic programming
+
+| Algorithm | Approach and correctness argument | Time / space | CityShield use |
+|---|---|---|---|
+| **Fractional knapsack** | rank by value density with a max-heap; take whole items, then a fraction of the first that does not fit. *Exchange argument*: moving weight from a less dense to a denser item never lowers value, so any optimum can be turned into the greedy solution. | O(n log n) / O(n) | split divisible relief supplies among zones |
+| **Maximum subarray (divide and conquer)** | the best block lies in the left half, the right half, or crosses the middle (best suffix + best prefix). | T(n) = 2T(n/2) + Θ(n) = Θ(n log n) | worst continuous incident-load period |
+| **0/1 knapsack (DP)** | K[i,c] = max(K[i-1,c], K[i-1,c-w_i] + v_i). Pseudo-polynomial. | Θ(nW) / Θ(nW) | choose infrastructure upgrades |
+| **LCS** | L[i,j] = L[i-1,j-1]+1 or max(L[i-1,j], L[i,j-1]); trace-back; two-row length-only version; brute force over subsequences. | Θ(mn) / Θ(mn) (Θ(min) for length) | find duplicate incident reports |
+
+## Branch and bound
+
+| Algorithm | Approach and correctness | Time / space | CityShield use |
+|---|---|---|---|
+| **Branch and bound engine** | one generic engine with three frontiers: **LIFO** (stack), **FIFO** (queue), **least-cost** (min-heap on the bound). A node is pruned when its lower bound is not below the incumbent; correct whenever the bound never overestimates. The dashboard uses least-cost. | O(b^d) worst; LC expands the fewest nodes | TSP below |
+| **TSP B&B** | reduced-cost-matrix bound (row/column minima must still be paid); verified against brute force. In the dashboard the 2-approximation's tour supplies the first upper bound. | O(n!) worst, O(n²) per node | inspection route (when it finishes) |
+
+## String matching
+
+| Algorithm | Idea | Time / space |
+|---|---|---|
+| **KMP** | prefix (failure) function: never re-read a text character; the matched length q grows ≤ n times in total so it can fall ≤ n times (amortised) | O(n+m) / O(m) |
+
+## Graph algorithms
+
+| Algorithm | Idea and correctness | Time / space |
+|---|---|---|
+| **Dijkstra** | greedy settle by a min-heap with lazy deletion; multi-source start gives *nearest-facility* distances; early exit at the target; correct for non-negative weights; validated against `igraph` on the **full 103k-node network** (maximum difference 0). All-pairs metrics for the small study areas are built from one Dijkstra run per node. | O((V+E) log V) / O(V+E) |
+| **Push-Relabel** | FIFO preflow-push with current-arc pointers and exact initial labels by reverse BFS (global relabel), gap heuristic; phase 1 yields the max-flow value, `complete = TRUE` returns excess to the source for a valid flow. Max-flow = min-cut. | O(V³) |
+| **Bipartite matching** | source -> left (cap 1), compatible pairs (cap 1), right -> sink (cap 1); an integral max flow of value k is a matching of size k. Verified against `igraph::max_bipartite_match` and an exhaustive backtracking reference. | O(V³) with push-relabel |
+
+## Geometric algorithms
+
+* **Line-segment properties**: the single primitive `cross(a,b,c)`; orientation, on-segment, length, angle, parallelism, point-segment distance, segment intersection (CLRS case analysis) and the intersection point.
+* **Sweep line** (Bentley-Ottmann, de Berg et al.): events (segment start, end, discovered crossing) in lexicographic order from a heap; the *status* is a hand-written **treap** (nodes are environments with parent pointers; rotations; expected O(log n) insert, delete, successor, predecessor and lower bound); only segments that *become neighbours* are tested; at an event all status segments through the point form a contiguous run found by one lower-bound search, they are reported, removed and re-inserted in their order just after the event. Vertical segments get slope +Inf (de Berg's horizontal-segment trick). **O((n+k) log n).** Because road data contain exactly touching and collinear segments and floating-point noise (a flood-boundary vertex 6·10⁻¹⁴ m from a road), all coordinates are snapped to a 10⁻⁶ grid and event keys are normalised; two real bugs found this way (event merging across a noise gap, `-0` vs `0` keys) are covered by regression tests, and the sweep reports *exactly* the pair set of a pairwise reference on road-grid data.
+* **Graham scan** (angular sort by a hand-written stable merge sort, stack with strict left turns; O(n log n)), compared with `grDevices::chull`/`sf::st_convex_hull`, including collinear, duplicate and all-on-hull inputs.
+
+## Randomized algorithms
+
+* **Quicksort**: random pivot; iterative with the smaller side processed first (stack depth O(log n) *even on adversarial input*). Expected comparisons 2n ln n for every input, because elements i<j are compared iff one is the first pivot chosen from z_i..z_j (probability 2/(j-i+1)). The deterministic last-element pivot is the baseline: Θ(n²) on sorted input. The dashboard uses it to rank incidents.
+* **Karger's minimum cut**: contract uniformly random edges (union-find, self-loops dropped lazily) until two super-nodes remain. A fixed minimum cut survives with probability ≥ Π(1 - 2/n') = 2/(n(n-1)), so n(n-1)/2·ln(1/δ) trials fail with probability ≤ δ. Validated against `igraph::min_cut` and an exhaustive 2^(n-1) reference (in the tests).
+
+## Approximation versus exact
+
+* **2-approximate vertex cover** (both endpoints of a maximal matching): the matched edges are disjoint, so OPT ≥ |M| while the cover has exactly 2|M| vertices. **Greedy set cover**: ≤ H(d)·OPT ≤ (ln d + 1)·OPT by a charging argument. **Metric TSP 2-approximation**: MST ≤ OPT, a preorder walk with shortcuts costs ≤ 2·MST. Exact counterparts (branch and bound with degree-1 / bound pruning for vertex cover, branch-on-rarest-element for set cover, reduced-matrix B&B for TSP) provide the optimum; the dashboard uses the exact solver whenever it finishes and falls back to the approximation otherwise.
+
+# Experiments: theory versus observation
+
+All timings come from `time_it()` (`bench::mark`, median of repeated runs); sizes are capped because R loops are 10-100× slower than compiled code (see Limitations). Experiments keep their original numbers 05-09; the comparisons that involved algorithms no longer in the project were removed. The text under every figure is **generated from the saved CSVs** by `benchmarks/notes.R`.
+
+## Randomized algorithms
+
+### 8. Karger: success rate vs number of trials
+```{r e8}
+img("08_karger_success.png")
+```
+`r note("08")`
+
+### 9. Randomized vs deterministic quicksort (adversarial inputs)
+```{r e9}
+img("09_quicksort_comparisons.png")
+```
+`r note("09")`
+
+# NP-hard problems: exact versus approximate
+
+The three NP-hard placement/inspection problems were solved **exactly** (branch and bound) and **approximately** on instances drawn from 50-150 node road subgraphs, so the empirical approximation ratio can be compared with the proven guarantee.
+
+### 5. TSP inspection routes: branch and bound vs MST 2-approximation
+```{r e5, out.width="48%", fig.show="hold"}
+img("05_tsp_runtime.png"); img("05_tsp_ratio.png")
+```
+`r note("05")`
+
+### 6. Station placement: exact vs greedy set cover (ln n bound)
+```{r e6, out.width="48%", fig.show="hold"}
+img("06_set_cover_runtime.png"); img("06_set_cover_ratio.png")
+```
+`r note("06")`
+
+### 7. Sensor placement: exact vs 2-approximate vertex cover
+```{r e7, out.width="48%", fig.show="hold"}
+img("07_vertex_cover_runtime.png"); img("07_vertex_cover_ratio.png")
+```
+`r note("07")`
+
+**Synthesis.** In all three problems the proven worst-case ratio (2, H(d), 2) was never violated, the *observed* ratios are far smaller than the guarantees on realistic road instances, and the exact solvers' running time grows by orders of magnitude over the tested range while the approximations stay in the millisecond range. The guarantee is nevertheless tight on adversarial inputs (perfect matchings force vertex cover to ratio exactly 2), which is why a guarantee - not an average - is what justifies using an approximation when no exact answer is affordable.
+
+### Per-algorithm benchmark registry
+Every algorithm also has its own entry (one fixed size) in `benchmarks/results/algorithm_registry.csv`:
+
+```{r registry, results='asis'}
+if (!is.null(reg)) { r <- reg[, c("module", "algorithm", "n", "median_ms", "theory_time", "theory_space")]; r$median_ms <- signif(r$median_ms, 3)
+  print(knitr::kable(r, row.names = FALSE, col.names = c("Module", "Algorithm", "n", "median ms", "Time (theory)", "Space (theory)"))) } else cat("*(run benchmarks/algorithm_registry.R)*")
+```
+
+# Dashboard walkthrough
+
+Run with `shiny::runApp("app")` from the project folder. Six tabs (Dispatch, Evacuation, Resilience, Placement, Logistics, Intel); each has a map or chart, a few summary cards and a short plain-English result. Everything expensive is read from `data/precomputed/*.rds`.
+
+```{r shots, results='asis'}
+shots <- list.files(file.path(root, "report", "img"), pattern = "\\.png$", full.names = TRUE)
+if (length(shots)) for (s in shots) cat(sprintf("![%s](%s){width=95%%}\n\n", sub("\\.png$", "", basename(s)), s))
+```
+
+| Tab | What you see | Controls | Algorithms |
+|---|---|---|---|
+| **Dispatch** | the batch of storm-surge incidents, stations, hospitals, the fastest route from the nearest station, assigned ambulance pairs | incident (ten most urgent), longest ambulance trip | push-relabel max flow (matching), Dijkstra, quicksort |
+| **Evacuation** | flood circle, evacuation flows by road, roads cut by the flood, affected area | flood scenario, map layers | push-relabel max flow, sweep line, Graham scan |
+| **Resilience** | weakest link of a 120-node road area (red), worst stretch of incident load | none (100 Karger trials, fixed seed) | Karger, maximum subarray |
+| **Placement** | Stations: set cover; Sensors: vertex cover | how far a station can reach | set cover, vertex cover (exact when it finishes, otherwise approximate) |
+| **Logistics** | Supplies by zone, Upgrades, Inspection route | supply share, budget, number of sites | fractional knapsack, 0/1 knapsack, TSP (exact B&B or 2-approximation) |
+| **Intel** | Search reports (keyword hits in context), Find duplicate reports (how many flags are correct, how many real duplicates are found) | keyword, amount of log, similarity needed | KMP, LCS |
+
+# Limitations
+
+* **R performance.** All graded algorithms are interpreted loops. A pure-R Dijkstra needs about 3.3 s for one full-city run (103k nodes) where compiled code needs milliseconds. Consequently benchmark sizes are *capped* and every cap is stated: TSP B&B, Karger, exact vertex cover and exact set cover use **50-150 node** road subgraphs; evacuation flows run on local windows of the city graph (a flow run on the full city graph would take minutes); the exact searches run under a node budget, and the dashboard falls back to the approximation when the budget is exhausted.
+* **Constants vs asymptotics.** Observed crossovers occur at sizes that differ from compiled-code folklore because interpreted overhead is not proportional to arithmetic operations; the slopes in log-log space, not the absolute times, are what should be compared with theory.
+* **Synthetic incident and call-log data.** Incidents, stations, hospitals and call logs are *generated* (seeded, hot-spot clustered, with a storm surge and planted duplicates); the road network is real. Duplicate detection numbers therefore describe the generator's templated text, not real 112 call logs.
+* **Road model.** Contracted road segments are drawn as straight chords between junctions; travel times use free-flow speed by road class and capacities are planning figures per road class, not measured traffic data; persons per vehicle = 3.
+* **Sweep line** assumes no two segments overlap collinearly (touching and crossing are handled) and works on a 10⁻⁶ coordinate grid.
+* **Karger** is run on the undirected simple version of 120-node subgraphs with a fixed 100 trials and seed; the proven per-trial bound 2/(n(n-1)) is a worst case that sparse road graphs far exceed.
+* **Data source.** The OSM extract comes from the regional Geofabrik file (the public Overpass servers were overloaded during development); the dataset is cached and never downloaded again.
+
+# Conclusion
+
+CityShield shows, on a real city network, how each algorithmic paradigm earns its place: greedy and divide-and-conquer for fast allocation and load analysis, dynamic programming for exact optimisation with structure, branch-and-bound where the problem is NP-hard and instances are small, graph algorithms for routing, assignment and evacuation, geometry for "which roads cross the flood line", randomization for robustness against adversarial inputs and for the weakest-link computation, and approximation algorithms with proven guarantees when exact answers are out of reach. All implementations are from scratch and validated against independent references (`igraph`, `sf`, brute force). The most useful lessons were practical as well as theoretical: R's copy-on-modify semantics decide whether a data structure achieves its textbook complexity; floating-point degeneracies (touching and near-touching segments) break geometric algorithms long before the asymptotics matter; and the gap between a proven worst-case guarantee and the ratio observed on real instances is large - but the guarantee is what makes an approximation trustworthy.
